@@ -10,7 +10,7 @@ import torch
 from tests.test_utils import assert_expected, fixed_init_model
 from torch import nn
 from torchtune.modules.model_fusion import DeepFusionModel
-from torchtune.utils.seed import set_seed
+from torchtune.training.seed import set_seed
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,7 @@ class DummyModel(nn.Module):
         self.v = nn.Linear(dim, dim)
         self.output = nn.Linear(dim, vocab_size)
 
-    def setup_caches(self, batch_size, dtype):
+    def setup_caches(self, batch_size, dtype, *args, **kwargs):
         self.cache_enabled = True
 
     def caches_are_enabled(self):

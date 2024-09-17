@@ -13,13 +13,11 @@ import torch
 from omegaconf import DictConfig
 
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
-
-from torchtune import config, utils
+from torchtune import config, generation, training, utils
+from torchtune.data import left_pad_sequence
 from torchtune.modules import TransformerDecoder
 from torchtune.modules.tokenizers import ModelTokenizer
 from torchtune.recipe_interfaces import EvalRecipeInterface
-
 
 logger = utils.get_logger("DEBUG")
 
@@ -112,15 +110,11 @@ class _EvalWrapper(HFLM):
         tokenized_text = [self.tok_encode(x) for x in text]
 
         # pad left
-        x = pad_sequence(
-            [
-                torch.tensor(x[::-1]) for x in tokenized_text
-            ],  # first flip each sequence and pad
+        x = left_pad_sequence(
+            [torch.tensor(x) for x in tokenized_text],
             batch_first=True,
             padding_value=self._tokenizer.pad_id,
-        ).flip(
-            dims=[1]
-        )  # flip back to correct order
+        )
 
         return x, torch.ones_like(x)  # return 'mask' b/c it's expected by the harness
 
@@ -160,7 +154,7 @@ class _EvalWrapper(HFLM):
                 "``do_sample`` for generation tasks is not supported yet in torchtune."
             )
 
-        toks = utils.generate(
+        toks, _ = generation.generate(
             self._model,
             context,
             max_generated_tokens=self.max_gen_toks,
@@ -168,6 +162,7 @@ class _EvalWrapper(HFLM):
             top_k=None,  # do_sample is not supported currently
             stop_tokens=self._tokenizer.stop_tokens,
         )
+        self._model.reset_caches()
         return torch.tensor(toks, dtype=torch.int32)
 
 
@@ -196,14 +191,14 @@ class EleutherEvalRecipe(EvalRecipeInterface):
 
     def setup(self) -> None:
         self._device = utils.get_device(device=self._cfg.device)
-        self._dtype = utils.get_dtype(dtype=self._cfg.dtype, device=self._device)
+        self._dtype = training.get_dtype(dtype=self._cfg.dtype, device=self._device)
         self._limit = self._cfg.limit
         self._tasks = list(self._cfg.tasks)
         self._quantizer = config.instantiate(self._cfg.quantizer)
-        self._quantization_mode = utils.get_quantizer_mode(self._quantizer)
+        self._quantization_mode = training.get_quantizer_mode(self._quantizer)
         self._enable_kv_cache = self._cfg.get("enable_kv_cache", True)
 
-        utils.set_seed(seed=self._cfg.seed)
+        training.set_seed(seed=self._cfg.seed)
 
         checkpointer = config.instantiate(self._cfg.checkpointer)
         if self._quantization_mode is None:
@@ -216,7 +211,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
 
         self._model = self._setup_model(
             model_cfg=self._cfg.model,
-            model_state_dict=ckpt_dict[utils.MODEL_KEY],
+            model_state_dict=ckpt_dict[training.MODEL_KEY],
         )
         self._tokenizer = config.instantiate(self._cfg.tokenizer)
         logger.info("Tokenizer is initialized from file.")
@@ -226,13 +221,17 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         model_cfg: DictConfig,
         model_state_dict: Dict[str, Any],
     ) -> nn.Module:
-        with utils.set_default_dtype(self._dtype), self._device:
+        with training.set_default_dtype(self._dtype), self._device:
             model = config.instantiate(model_cfg)
+
         if self._quantization_mode is not None:
             model = self._quantizer.quantize(model)
             model = model.to(device=self._device, dtype=self._dtype)
-
-        model.load_state_dict(model_state_dict)
+            for k, v in model_state_dict.items():
+                model_state_dict[k] = v.to(self._device)
+            model.load_state_dict(model_state_dict, assign=True)
+        else:
+            model.load_state_dict(model_state_dict)
 
         # Put model in eval mode.
         # Note: This will not disable the dropout applied in SDPA,
@@ -240,7 +239,9 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         model.eval()
 
         # Validate model was loaded in with the expected dtype.
-        utils.validate_expected_param_dtype(model.named_parameters(), dtype=self._dtype)
+        training.validate_expected_param_dtype(
+            model.named_parameters(), dtype=self._dtype
+        )
         logger.info(f"Model is initialized with precision {self._dtype}.")
         return model
 
